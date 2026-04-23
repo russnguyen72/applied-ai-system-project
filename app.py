@@ -4,6 +4,7 @@ from datetime import time
 
 import streamlit as st
 
+from ai_ui import render_assistant
 from pawpal_system import Owner, Pet, Task
 
 st.set_page_config(page_title="PawPal+", page_icon="🐾", layout="centered")
@@ -97,6 +98,11 @@ if "schedule" not in st.session_state:
 
 
 owner: Owner = st.session_state.owner
+
+# ── AI Assistant ───────────────────────────────────────────────────────────
+st.subheader("AI Assistant")
+render_assistant(owner)
+st.divider()
 
 # ── Owner & Pets ───────────────────────────────────────────────────────────
 st.subheader("Quick Demo Inputs")
