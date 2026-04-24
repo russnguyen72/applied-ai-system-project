@@ -126,17 +126,11 @@ def _render_idle(controller: AssistantController) -> None:
         ),
         height=120,
     )
-    st.toggle(
-        "Show thinking",
-        key="ai_show_thinking",
-        value=st.session_state.get("ai_show_thinking", False),
-        help="Stream the model's reasoning live. Helpful for demos; slightly slower.",
-    )
     existing_names = [p.name for p in st.session_state.owner.pets]
     if st.button("Generate plan", type="primary", use_container_width=True):
         text = st.session_state.get("ai_prompt_input", "").strip()
         if text:
-            show_thinking = st.session_state.get("ai_show_thinking", False)
+            show_thinking = True
 
             def invoke(on_progress, on_thinking, show):
                 controller.submit_prompt(
@@ -171,7 +165,7 @@ def _render_clarification(controller: AssistantController) -> None:
     if reply_clicked:
         reply = st.session_state.get("ai_clarification_input", "").strip()
         if reply:
-            show_thinking = st.session_state.get("ai_show_thinking", False)
+            show_thinking = True
 
             def invoke(on_progress, on_thinking, show):
                 controller.submit_clarification(

@@ -58,7 +58,7 @@ Rules:
 - Always call `create_pet` before `create_task` for any pet that doesn't already exist.
 - Reference existing pets by their exact name (case-sensitive).
 - If a pet the user mentions already exists, do NOT create a duplicate — reuse it or call `ask_clarification` if it's ambiguous.
-- If a required field (pet name, species, task time, or repeat frequency) is unclear, call `ask_clarification` with a single focused question instead of guessing.
+- If a required field (pet name, species, task time, or repeat frequency) is unclear, call `ask_clarification` with at most 4 focused questions, only one per required field, instead of guessing.
 - You can do simple arithmetic for reminders. Example: 100 servings of food ÷ 4 servings/day (2 dogs × 2 meals) = 25 days. To remind when ~10 servings remain, schedule a reminder that starts in 22 days (when ~12 servings remain) and does not repeat (frequency_days=0).
 - `scheduled_time` must be 24-hour HH:MM format (e.g., "07:30", "18:00").
 - `frequency_days` is an integer: 0 for one-time tasks, 1 for daily, 7 for weekly, 30 for monthly, etc.
