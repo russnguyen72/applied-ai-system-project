@@ -13,9 +13,11 @@ class OllamaBackend:
         self,
         model: str = "qwen3.5:4b",
         host: str = "http://localhost:11434",
+        keep_alive: str = "30m",
     ) -> None:
         self.model = model
         self.host = host
+        self.keep_alive = keep_alive
         self._client = None
 
     def _get_client(self):
@@ -53,6 +55,7 @@ class OllamaBackend:
                 messages=messages,
                 tools=tools,
                 think=think,
+                keep_alive=self.keep_alive,
             )
         except TypeError:
             # Older ollama client versions don't accept `think` — retry without it.
@@ -61,6 +64,7 @@ class OllamaBackend:
                     model=self.model,
                     messages=messages,
                     tools=tools,
+                    keep_alive=self.keep_alive,
                 )
             except Exception as e:
                 raise self._raise_friendly(e) from e
@@ -95,6 +99,7 @@ class OllamaBackend:
                 tools=tools,
                 think=think,
                 stream=True,
+                keep_alive=self.keep_alive,
             )
         except TypeError:
             # Older client: retry without think.
@@ -104,6 +109,7 @@ class OllamaBackend:
                     messages=messages,
                     tools=tools,
                     stream=True,
+                    keep_alive=self.keep_alive,
                 )
             except Exception:
                 return self.chat(messages, tools, think=think)
@@ -141,7 +147,10 @@ class OllamaBackend:
 
                 tc = msg.get("tool_calls") or []
                 if tc:
-                    final_tool_calls = list(tc)
+                    # Ollama streams tool calls non-cumulatively — each chunk carries
+                    # only the call(s) emitted in that chunk, not the running total.
+                    # Extend, don't replace, or all but the last chunk's calls are lost.
+                    final_tool_calls.extend(tc)
                 role = msg.get("role")
                 if role:
                     final_role = role

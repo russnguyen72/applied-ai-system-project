@@ -55,15 +55,13 @@ class StagedPlan:
 SYSTEM_PROMPT = """You are PawPal+'s scheduling assistant. The user describes pets and care routines in natural language, and you translate that into structured pet and task records by calling tools.
 
 Rules:
-- Always call `create_pet` before `create_task` for any pet that doesn't already exist.
-- Reference existing pets by their exact name (case-sensitive).
-- If a pet the user mentions already exists, do NOT create a duplicate — reuse it or call `ask_clarification` if it's ambiguous.
-- If a required field (pet name, species, task time, or repeat frequency) is unclear, call `ask_clarification` with at most 4 focused questions, only one per required field, instead of guessing.
+- BATCH all tool calls for one user request into a SINGLE assistant message. List them in dependency order: every `create_pet` first, then `create_task` calls that reference it, then `finalize_plan` at the end. Do not spread these across multiple turns.
+- Reference existing pets by their exact name (case-sensitive). If a pet the user mentions already exists, do NOT create a duplicate — reuse it.
+- If a required field is unclear, stage everything you ARE sure of (`create_pet` / `create_task`) in this message and append a single `ask_clarification` call AFTER them — do NOT call `finalize_plan` yet. You will finalize on the next turn once the user answers. Ask at most 4 focused questions, only one per missing field, instead of guessing.
 - You can do simple arithmetic for reminders. Example: 100 servings of food ÷ 4 servings/day (2 dogs × 2 meals) = 25 days. To remind when ~10 servings remain, schedule a reminder that starts in 22 days (when ~12 servings remain) and does not repeat (frequency_days=0).
 - `scheduled_time` must be 24-hour HH:MM format (e.g., "07:30", "18:00").
 - `frequency_days` is an integer: 0 for one-time tasks, 1 for daily, 7 for weekly, 30 for monthly, etc.
 - `start_in_days` offsets when the first occurrence is due, counting from today. 0 means "today." Use this for reminders that shouldn't trigger until later.
-- When you've staged everything the user asked for, call `finalize_plan` with a one-sentence summary.
 
 Stay concise. Prefer calling tools over chatting."""
 
@@ -216,11 +214,35 @@ class AssistantController:
             return
         if thinking_enabled is not None:
             self.thinking_enabled = thinking_enabled
-        self.messages.append({"role": "user", "content": text})
+        self._fold_clarification_answer(text)
         self.pending_question = None
         self.state = AssistantState.PLANNING
         self._emit("Processing your reply", progress_callback)
         self._run_turn_loop(progress_callback, thinking_callback)
+
+    def _fold_clarification_answer(self, answer: str) -> None:
+        """Rewrites the most recent ask_clarification tool result to include the
+        user's answer, so the conversation ends with a self-contained tool-call/
+        result pair (the shape tool-calling models expect) instead of a stray
+        `user` turn after a `tool` turn.
+        """
+        for i in range(len(self.messages) - 1, -1, -1):
+            msg = self.messages[i]
+            if msg.get("role") == "tool" and msg.get("name") == "ask_clarification":
+                payload = json.dumps({
+                    "ok": True,
+                    "question": self.pending_question or "",
+                    "answer": answer,
+                })
+                self.messages[i] = {
+                    "role": "tool",
+                    "name": "ask_clarification",
+                    "content": payload,
+                }
+                return
+        # Defensive fallback: state said AWAITING_CLARIFICATION but no tool message
+        # was found. Append the answer as a user turn so it isn't lost.
+        self.messages.append({"role": "user", "content": answer})
 
     @staticmethod
     def _emit(label: str, cb: ProgressCallback | None) -> None:

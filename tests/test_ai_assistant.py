@@ -1,6 +1,7 @@
 """Tests for the AI assistant controller. Uses a FakeBackend — no network calls."""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import uuid
@@ -813,3 +814,366 @@ def test_unknown_tool_call_loops_with_error():
 
     assert controller.state == AssistantState.READY_TO_REVIEW
     assert len(controller.staged_plan.pets) == 1
+
+
+# --- Module-level helper tests ---
+
+
+def test_parse_time_returns_time():
+    from ai_assistant import _parse_time
+    assert _parse_time("08:30") == time(8, 30)
+    assert _parse_time("18:00") == time(18, 0)
+
+
+def test_parse_date_returns_date():
+    from ai_assistant import _parse_date
+    assert _parse_date("2024-06-15") == date(2024, 6, 15)
+
+
+# --- Controller __init__ defaults ---
+
+
+def test_controller_init_defaults():
+    controller = AssistantController(backend=FakeBackend([]))
+    assert controller.state == AssistantState.IDLE
+    assert controller.messages == []
+    assert controller.staged_plan.pets == []
+    assert controller.staged_plan.tasks == []
+    assert controller.pending_question is None
+    assert controller.error_message is None
+    assert controller.existing_pet_names == []
+    assert controller.thinking_enabled is False
+    assert controller.thinking_log == []
+
+
+# --- _emit (static) tests ---
+
+
+def test_emit_with_none_callback_is_noop():
+    AssistantController._emit("hello", None)
+
+
+def test_emit_swallows_callback_exceptions():
+    def raising_cb(_label):
+        raise RuntimeError("boom")
+    AssistantController._emit("hello", raising_cb)
+
+
+def test_emit_invokes_callback():
+    received: list[str] = []
+    AssistantController._emit("hello", received.append)
+    assert received == ["hello"]
+
+
+# --- _label_for_tool_call (static) tests ---
+
+
+def test_label_for_tool_call_all_branches():
+    L = AssistantController._label_for_tool_call
+    assert L("create_pet", {"name": "Max"}) == "Adding pet: Max"
+    assert L("create_pet", {}) == "Adding pet: pet"
+    assert L("create_task", {"pet_name": "Max", "task_name": "Walk"}) == "Scheduling Walk for Max"
+    assert L("create_task", {}) == "Scheduling task for pet"
+    assert L("ask_clarification", {}) == "Preparing a question"
+    assert L("finalize_plan", {}) == "Finalizing plan"
+    assert L("mystery", {}) == "Processing mystery"
+
+
+# --- _handle_tool_call dispatch tests ---
+
+
+def test_handle_tool_call_dispatches_create_pet():
+    controller = AssistantController(backend=FakeBackend([]))
+    result = controller._handle_tool_call("create_pet", {"name": "Max", "animal_type": "dog"})
+    parsed = json.loads(result)
+    assert parsed["ok"] is True
+    assert [p.name for p in controller.staged_plan.pets] == ["Max"]
+
+
+def test_handle_tool_call_unknown_tool_returns_error():
+    controller = AssistantController(backend=FakeBackend([]))
+    result = controller._handle_tool_call("nonexistent", {})
+    parsed = json.loads(result)
+    assert parsed["ok"] is False
+    assert "unknown tool" in parsed["error"]
+
+
+def test_handle_tool_call_swallows_exception_from_tool():
+    controller = AssistantController(backend=FakeBackend([]))
+
+    def boom(_args):
+        raise RuntimeError("kaboom")
+    controller._tool_create_pet = boom  # shadow instance attribute
+
+    result = controller._handle_tool_call("create_pet", {})
+    parsed = json.loads(result)
+    assert parsed["ok"] is False
+    assert "kaboom" in parsed["error"]
+
+
+# --- _tool_ask_clarification tests ---
+
+
+def test_tool_ask_clarification_sets_pending_question():
+    controller = AssistantController(backend=FakeBackend([]))
+    result = controller._tool_ask_clarification({"question": "When?"})
+    parsed = json.loads(result)
+    assert parsed["ok"] is True
+    assert parsed["awaiting_user"] is True
+    assert controller.pending_question == "When?"
+
+
+def test_tool_ask_clarification_rejects_invalid():
+    controller = AssistantController(backend=FakeBackend([]))
+    for bad in ({}, {"question": ""}, {"question": "   "}, {"question": 42}):
+        result = controller._tool_ask_clarification(bad)
+        assert json.loads(result)["ok"] is False
+    assert controller.pending_question is None
+
+
+# --- _tool_finalize_plan tests ---
+
+
+def test_tool_finalize_plan_sets_summary():
+    controller = AssistantController(backend=FakeBackend([]))
+    result = controller._tool_finalize_plan({"summary": "All done."})
+    parsed = json.loads(result)
+    assert parsed["ok"] is True
+    assert controller.staged_plan.summary == "All done."
+
+
+def test_tool_finalize_plan_defaults_when_missing_or_empty():
+    controller = AssistantController(backend=FakeBackend([]))
+    controller._tool_finalize_plan({})
+    assert controller.staged_plan.summary == "Plan ready for review."
+
+    controller2 = AssistantController(backend=FakeBackend([]))
+    controller2._tool_finalize_plan({"summary": ""})
+    assert controller2.staged_plan.summary == "Plan ready for review."
+
+    controller3 = AssistantController(backend=FakeBackend([]))
+    controller3._tool_finalize_plan({"summary": 123})
+    assert controller3.staged_plan.summary == "Plan ready for review."
+
+
+# --- _fold_clarification_answer tests ---
+
+
+def test_fold_clarification_answer_rewrites_tool_message():
+    controller = AssistantController(backend=FakeBackend([]))
+    controller.pending_question = "What time?"
+    controller.messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "Add Max"},
+        {"role": "assistant", "content": "", "tool_calls": []},
+        {
+            "role": "tool",
+            "name": "ask_clarification",
+            "content": json.dumps({"ok": True, "awaiting_user": True}),
+        },
+    ]
+
+    controller._fold_clarification_answer("8am")
+
+    folded = controller.messages[-1]
+    assert folded["role"] == "tool"
+    assert folded["name"] == "ask_clarification"
+    payload = json.loads(folded["content"])
+    assert payload == {"ok": True, "question": "What time?", "answer": "8am"}
+    # No extra user message appended.
+    assert len(controller.messages) == 4
+
+
+def test_fold_clarification_answer_finds_most_recent():
+    controller = AssistantController(backend=FakeBackend([]))
+    controller.pending_question = "Latest?"
+    controller.messages = [
+        {"role": "tool", "name": "ask_clarification", "content": "old"},
+        {"role": "user", "content": "first reply"},
+        {"role": "tool", "name": "create_pet", "content": "{}"},
+        {"role": "tool", "name": "ask_clarification", "content": "newer"},
+    ]
+
+    controller._fold_clarification_answer("answer")
+
+    # Only the newest match should be rewritten.
+    assert controller.messages[0]["content"] == "old"
+    assert controller.messages[2]["content"] == "{}"
+    payload = json.loads(controller.messages[3]["content"])
+    assert payload["answer"] == "answer"
+
+
+def test_fold_clarification_answer_falls_back_when_no_tool_message():
+    controller = AssistantController(backend=FakeBackend([]))
+    controller.pending_question = "Q?"
+    controller.messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hi"},
+    ]
+
+    controller._fold_clarification_answer("the reply")
+
+    assert controller.messages[-1] == {"role": "user", "content": "the reply"}
+
+
+def test_fold_clarification_answer_handles_missing_pending_question():
+    controller = AssistantController(backend=FakeBackend([]))
+    controller.pending_question = None
+    controller.messages = [
+        {"role": "tool", "name": "ask_clarification", "content": "old"},
+    ]
+
+    controller._fold_clarification_answer("answer")
+
+    payload = json.loads(controller.messages[0]["content"])
+    assert payload["question"] == ""
+    assert payload["answer"] == "answer"
+
+
+# --- Response parsing helper tests (_extract_*, _normalize_assistant_msg) ---
+
+
+def test_extract_message_from_dict():
+    response = {"message": {"role": "assistant", "content": "hi"}}
+    assert AssistantController._extract_message(response) == {"role": "assistant", "content": "hi"}
+
+
+def test_extract_message_handles_missing_and_non_dict():
+    assert AssistantController._extract_message({}) == {}
+    assert AssistantController._extract_message("not a dict") == {}
+    assert AssistantController._extract_message({"message": None}) == {}
+
+
+def test_extract_message_handles_model_dump_object():
+    class FakeMsg:
+        def model_dump(self):
+            return {"role": "assistant", "content": "from dump"}
+    assert AssistantController._extract_message({"message": FakeMsg()}) == {
+        "role": "assistant", "content": "from dump",
+    }
+
+
+def test_extract_tool_calls():
+    msg = {"tool_calls": [{"function": {"name": "x"}}]}
+    assert AssistantController._extract_tool_calls(msg) == [{"function": {"name": "x"}}]
+    assert AssistantController._extract_tool_calls({}) == []
+    assert AssistantController._extract_tool_calls({"tool_calls": None}) == []
+
+
+def test_extract_text():
+    assert AssistantController._extract_text({"content": "hello"}) == "hello"
+    assert AssistantController._extract_text({"content": None}) == ""
+    assert AssistantController._extract_text({"content": 42}) == ""
+    assert AssistantController._extract_text({}) == ""
+
+
+def test_extract_name_and_args_dict_form():
+    call = {"function": {"name": "create_pet", "arguments": {"name": "Max"}}}
+    name, args = AssistantController._extract_name_and_args(call)
+    assert name == "create_pet"
+    assert args == {"name": "Max"}
+
+
+def test_extract_name_and_args_string_arguments():
+    call = {"function": {"name": "create_pet", "arguments": '{"name": "Max"}'}}
+    name, args = AssistantController._extract_name_and_args(call)
+    assert (name, args) == ("create_pet", {"name": "Max"})
+
+
+def test_extract_name_and_args_invalid_json_string():
+    call = {"function": {"name": "x", "arguments": "not-json"}}
+    name, args = AssistantController._extract_name_and_args(call)
+    assert name == "x"
+    assert args == {}
+
+
+def test_extract_name_and_args_top_level_fallback():
+    call = {"name": "create_pet", "arguments": {"name": "Max"}}
+    name, args = AssistantController._extract_name_and_args(call)
+    assert name == "create_pet"
+    assert args == {"name": "Max"}
+
+
+def test_extract_name_and_args_model_dump_call():
+    class FakeCall:
+        def model_dump(self):
+            return {"function": {"name": "create_pet", "arguments": {"name": "Max"}}}
+    name, args = AssistantController._extract_name_and_args(FakeCall())
+    assert name == "create_pet"
+    assert args == {"name": "Max"}
+
+
+def test_extract_name_and_args_model_dump_function():
+    class FakeFn:
+        def model_dump(self):
+            return {"name": "create_pet", "arguments": {"name": "Max"}}
+    name, args = AssistantController._extract_name_and_args({"function": FakeFn()})
+    assert name == "create_pet"
+    assert args == {"name": "Max"}
+
+
+def test_extract_name_and_args_non_dict_args_returns_empty():
+    call = {"function": {"name": "x", "arguments": ["not", "a", "dict"]}}
+    _, args = AssistantController._extract_name_and_args(call)
+    assert args == {}
+
+
+def test_normalize_assistant_msg_basic():
+    out = AssistantController._normalize_assistant_msg({"role": "assistant", "content": "hello"})
+    assert out == {"role": "assistant", "content": "hello"}
+
+
+def test_normalize_assistant_msg_default_role_and_non_string_content():
+    out = AssistantController._normalize_assistant_msg({})
+    assert out["role"] == "assistant"
+    assert out["content"] == ""
+
+    out2 = AssistantController._normalize_assistant_msg({"role": "assistant", "content": None})
+    assert out2["content"] == ""
+
+
+def test_normalize_assistant_msg_coerces_model_dump_tool_calls():
+    class FakeCall:
+        def model_dump(self):
+            return {"function": {"name": "y"}}
+    msg = {"role": "assistant", "content": "", "tool_calls": [FakeCall()]}
+    out = AssistantController._normalize_assistant_msg(msg)
+    assert out["tool_calls"] == [{"function": {"name": "y"}}]
+
+
+def test_normalize_assistant_msg_omits_empty_or_missing_tool_calls():
+    out_empty = AssistantController._normalize_assistant_msg(
+        {"role": "assistant", "content": "", "tool_calls": []},
+    )
+    assert "tool_calls" not in out_empty
+
+    out_missing = AssistantController._normalize_assistant_msg({"role": "assistant", "content": ""})
+    assert "tool_calls" not in out_missing
+
+
+# --- submit_prompt system prompt augmentation ---
+
+
+def test_submit_prompt_augments_system_prompt_with_existing_pets():
+    backend = FakeBackend([
+        _response_with_calls([_tool_call("finalize_plan", {"summary": "ok"})]),
+    ])
+    controller = AssistantController(backend=backend)
+    controller.submit_prompt("hello", existing_pet_names=["Rex", "Felix"])
+
+    system_msg = backend.sent_messages[0][0]
+    assert system_msg["role"] == "system"
+    assert "Rex" in system_msg["content"]
+    assert "Felix" in system_msg["content"]
+    assert "Existing pets in the tracker" in system_msg["content"]
+
+
+def test_submit_prompt_no_augment_when_no_existing_pets():
+    backend = FakeBackend([
+        _response_with_calls([_tool_call("finalize_plan", {"summary": "ok"})]),
+    ])
+    controller = AssistantController(backend=backend)
+    controller.submit_prompt("hello")
+
+    system_msg = backend.sent_messages[0][0]
+    assert "Existing pets in the tracker" not in system_msg["content"]
